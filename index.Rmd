@@ -1,0 +1,591 @@
+---
+title: "KC Housing Predictive Analytics"
+author: "Aziz"
+date: "4/17/2018"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Pre-processing Data
+
+###Load required packages
+```{r, message=FALSE, warning=FALSE}
+library(lubridate)
+library(car)
+library(psych)
+library(leaps)
+library(FNN)
+library(MASS)
+library(glmnet)
+library(broom)
+library(ggplot2)
+```
+
+###Read in data
+```{r}
+options(scipen=999)
+df <- read.csv('KC_House_Data.csv')
+```
+
+###Remove commas and dollar signs from numeric data
+```{r}
+df$price <- gsub(',', '', df$price)
+df$price <- as.numeric(gsub('$', '', df$price, fixed=TRUE))
+df$sqft_living <-as.numeric(gsub(',', '', df$sqft_living))
+df$sqft_lot <- as.numeric(gsub(',', '', df$sqft_lot))
+df$sqft_above <- as.numeric(gsub(',', '', df$sqft_above))
+df$sqft_basement <- as.numeric(gsub(',', '', df$sqft_basement))
+```
+
+###Fix date column
+```{r}
+df$date <- gsub('T000000', '', df$date)
+df$date <- as.Date(paste0(substr(df$date, 0, 4), '-', 
+                          substr(df$date, 5, 6), '-', 
+                          substr(df$date, 7, 9)))
+```
+
+###Remove extraneous variables
+
+Only select variables that we can model in a linear regression. Must remove ID and zipcode
+```{r}
+mod.data <- df[, !colnames(df) %in% c('id', 'zipcode')]
+```
+
+###Engineer new features
+Make new dummy-coded numeric predictor for fiscal quarter 
+```{r}
+mod.data$fiscal_quarter <- as.factor(quarter(mod.data$date))
+fq_dc <- dummy.code(mod.data$fiscal_quarter)
+colnames(fq_dc) <- c('fq_1', 'fq_2', 'fq_3', 'fq_4')
+mod.data <- cbind(mod.data, fq_dc)
+mod.data$fiscal_quarter <- NULL
+```
+
+Make new predictor for year of date and remove original date column
+```{r}
+mod.data$year <- as.numeric(year(mod.data$date))
+mod.data$date <- NULL
+```
+
+
+###Explore a few variables
+```{r}
+hist(mod.data$price, 
+     main='Histogram of Price',
+     xlab='Price ($)')
+```
+Looks like price is right skewed. This is good to keep in mind when checking the regression assumptions. 
+
+
+```{r}
+hist(mod.data$sqft_living, 
+     main='Histogram of Sqft living',
+     xlab='Sq. feet')
+```
+
+```{r}
+hist(mod.data$bedrooms, 
+     main='Histogram of Bedrooms',
+     xlab='Bedrooms')
+```
+
+
+###Check for multicollinearity
+```{r}
+cor(mod.data)[which(cor(mod.data) > .8)]
+```
+Correlation matrix finds only one pairwise correlation above .8
+So aside from this, multicollinearity may not be too big of a problem.
+
+```{r}
+cor(mod.data)
+```
+
+Correlation matrix suggests sqft_above and sqft_living are highly correlated. But do the Variance Inflation Factors also suggest this?
+
+####Let's build a model and check the Variance Inflation Factors (VIF)
+
+```{r}
+mod <- lm(price ~ ., data = mod.data)
+summary(mod)
+```
+Interesting - lm function could not fit this model due to sqft_basement and fq_4
+All information contained in sqft_basement is fully explained by a combination of the other variables. Same with fq_4.
+
+#### So remove these problematic variables and re-build model
+```{r}
+mod.data$sqft_basement <- NULL
+mod.data$fq_4 <- NULL
+
+mod <- lm(price ~ ., data = mod.data)
+summary(mod)
+```
+
+####Check VIF
+```{r}
+vif(mod)
+```
+
+Only two possibly problematic variables: sqft_above and sqft_living. However, neither VIFs exceed 10, which means it is probably safe to leave them in.
+
+
+####Check condition index
+Condition index is the square root of the ratio of the largest eigenvalue to the corresponding eigenvalue.
+```{r}
+cor.mat <- cor(mod.data)
+eigens <- eigen(cor.mat)
+
+con.ind <- sqrt(max(eigens$values)/eigens$values)
+con.ind
+```
+
+Condition number is the largest condition index
+```{r}
+con.num <- max(con.ind)
+con.num
+```
+Condition numbers of 30-100 are considered strong multicollinearity. This data has a low condition number, so multicollinearity is likely not a problem. 
+
+
+#Models for Predictive Analytics
+First, lets split the data into a 70% training and 30% test set, for model validation.
+```{r}
+set.seed(42)
+test.i <- sample(1:nrow(mod.data), .3*nrow(mod.data), replace=FALSE)
+test.data <- mod.data[test.i,]
+train.data <- mod.data[-test.i,]
+```
+
+##Folk Wisdom Model
+First we will build a model that is based on folk wisdom and common sense about real estate. We'll later see how it compares to the other models we built with an algorithm.  
+
+```{r}
+folk.mod <- lm(price ~ bedrooms + bathrooms + sqft_living + sqft_lot + floors + 
+                       waterfront + view + condition + sqft_above + 
+                       year + yr_built + yr_renovated, data = train.data)
+summary(folk.mod)
+```
+
+```{r}
+paste('The R^2 coefficient of determination is', summary(folk.mod)$r.squared)
+paste('The adjusted R^2 is', summary(folk.mod)$adj.r.squared)
+```
+###Check VIFs
+```{r}
+vif(folk.mod)
+```
+Vifs appear to be pretty solid. None over 10. 
+This implies there is no multicollinearity.
+
+###Checking Regression Assumptions
+Now let's assess the regression assumptions of this model
+```{r}
+plot(folk.mod)
+```
+To me, it looks like the residual variance is not constant. 
+As fitted values increase, the residual variance also increases. 
+
+The qqplot reveals that the residuals are not normally distributed. 
+
+Thus, while this linear model is significant, there is probably a better
+non-linear fit to the data. 
+
+Let's try log-transforming price to see if that improves our fit. 
+```{r}
+folk.mod.log <- lm(log(price) ~ bedrooms + bathrooms + sqft_living + sqft_lot + floors + 
+                       waterfront + view + condition + sqft_above + 
+                       year + yr_built + yr_renovated, data = train.data)
+summary(folk.mod.log)
+```
+Notice that R^2 went down slightly. However, the sums of squares between this and the previous model are not comparable because we log-transformed the DV. Of more importance, let's check the residuals plot to see if our transformed model better meets the regression assumptions. 
+
+```{r}
+plot(folk.mod.log)
+```
+
+Indeed, we can see the issue with non-constant variance is much improved. 
+
+In addition, the qqplot shows the residuals are now much more normally distributed. 
+
+###Predictive Performance
+Let's now predict with it
+```{r}
+preds <- predict(folk.mod.log, test.data)
+mse <- mean((preds-test.data$price)^2)
+paste('The MSE prediction error is', mse)
+```
+
+
+##Multiple Linear Regression via Hand-Coded Forward Selection
+
+The following code we found online and adapted it for our problem. 
+It performs stepwise linear regression. 
+
+On the first iteration, it finds the single best predictor of price in terms of R^2. 
+On the second iteration, it includes that predictor in the model and then finds
+the next best predictor of price in terms of overall R^2 of the model. 
+It repeats this process until there are no more predictors remaining. 
+
+The result will be a full model in order of 
+```{r}
+# Stepwise linear regression
+list.of.used.predictors = list()
+
+mod.predictors <- colnames(mod.data)[!colnames(mod.data) %in% 'price']
+r2.bin <- data.frame(Formula=character(length(mod.predictors)), 
+                     R2 = numeric(length(mod.predictors)),
+                     AdjR2 = numeric(length(mod.predictors)),
+                     stringsAsFactors = FALSE)
+
+for(j in 1:length(mod.predictors)){
+        mod.predictors <- mod.predictors[!(mod.predictors %in% list.of.used.predictors)]
+        
+        r.squared.bin <- data.frame(Var = mod.predictors,
+                                    R2 = numeric(length(mod.predictors)),
+                                    AdjR2 = numeric(length(mod.predictors)))
+        
+        for(i in 1:length(mod.predictors)){
+                predictor_vars_thusfar = paste(unlist(list.of.used.predictors), collapse='+')
+                formula <- paste("price ~ ", predictor_vars_thusfar, ' + ', mod.predictors[i], sep = "")
+                #print(formula)
+                mod <- lm(formula, data = train.data)
+                r.squared.bin$Var[i] <- mod.predictors[i]
+                r.squared.bin$R2[i] <- summary(mod)$r.squared
+                r.squared.bin$AdjR2[i] <- summary(mod)$adj.r.squared
+        }
+        
+        best.var <- r.squared.bin$Var[which.max(r.squared.bin$R2)]        
+        list.of.used.predictors[[j]] <- as.character(best.var)
+        if (j == 1){
+                best.formula <- paste("price ~ ", best.var, sep = "")
+        } else { 
+                best.formula <- paste(best.formula, '+', best.var, sep='')}
+        print(paste('Best formula on iteration', j, 'based on R^2 is: ', best.formula))
+        
+        best.current.mod <- lm(best.formula, data = mod.data)
+        r2.bin$Formula[j] <- as.character(best.formula)
+        r2.bin$R2[j] <- summary(best.current.mod)$r.squared
+        r2.bin$AdjR2[j] <- summary(best.current.mod)$adj.r.squared
+}
+```
+
+###Plot a histogram of the R^2 values
+```{r}
+hist(r2.bin$R2, main='Hi', xlab='R^2')
+```
+
+
+### Select best model based on adjusted R^2
+```{r}
+paste('The best model overall in terms of adjusted R^2 is:', r2.bin[which.max(r2.bin$AdjR2),'Formula'])
+```
+###Predictive Performance
+Let's now predict with it
+```{r}
+best.hand.fwd.selection.mod <- lm(r2.bin[which.max(r2.bin$AdjR2),'Formula'], 
+                                  data = train.data)
+preds <- predict(best.hand.fwd.selection.mod, test.data)
+mse <- mean((preds-test.data$price)^2)
+paste('The MSE prediction error is', mse)
+```
+
+###Comparison to folk model
+Note, the MSE is slightly higher here than the folk wisdom model. 
+
+##Multiple Linear Regression via Leaps Package Forward Selection
+###Preprocessing
+####Variable selection
+Perform a forward selection algorithm to find best models. The following code will find the best single predictor model, the best 2-predictor model, the best 3-predictor model, ..., the best 8-predictor model. 
+
+```{r}
+regsubsets.out <-
+        regsubsets(price ~ ., 
+                   data = train.data,
+                   nbest = 1,       # 1 best models for each number of predictors
+                   method = "forward")
+
+
+summary.out <- summary(regsubsets.out)
+summary.out
+```
+The output above shows the selected variables for each model (with asterisks).
+
+```{r}
+plot(regsubsets.out, scale = "adjr2", main = "Adjusted R^2")
+```
+This plot shows the features associated with the best models in terms of Adjusted R^2. 
+Adjusted R^2 is on the y-axis and the included features for each model are colored in. 
+
+####Building out best multiple linear regression model
+Based on Adjusted R^2, let's build our 8 best multiple linear regression models
+to use for prediction.
+
+```{r}
+mod1 <- lm(price ~ bedrooms + bathrooms + sqft_living + waterfront + 
+                   view + grade + yr_built + lat,
+           data = train.data)
+
+mod2 <- lm(price ~ bedrooms + sqft_living + waterfront + view + 
+                   grade + yr_built + lat,
+           data = train.data)
+
+mod3 <- lm(price ~ bedrooms + sqft_living + waterfront + 
+                   view + grade + yr_built + lat,
+           data = train.data)
+
+mod4 <- lm(price ~ sqft_living + view + grade + 
+                   yr_built + lat,
+           data = train.data)
+
+mod5 <- lm(price ~ sqft_living + view + grade + lat, 
+           data = train.data)
+
+mod6 <- lm(price ~ sqft_living + view + lat, 
+           data = train.data)
+
+mod7 <- lm(price ~ sqft_living + lat, 
+           data = train.data)
+
+mod8 <- lm(price ~ sqft_living, 
+           data = train.data)
+```
+
+###Predictive Performance
+Build a list of models to iterate over and make predictions. 
+
+```{r}
+mlr.mod.list <- list(mod1, mod2, mod3, mod4, mod5, mod6, mod7, mod8)
+```
+
+Also set up an empty storage bin for keeping track of MSE (prediction error). 
+```{r}
+storage.bin <- data.frame(Mod = c('mod1', 'mod2', 'mod3', 'mod4', 'mod5', 'mod6', 
+                                  'mod7', 'mod8'),
+                          MSE = numeric(length(mlr.mod.list)))
+storage.bin
+```
+
+Next, iterate over the model list. On each iteration:
+1) Predict prices on all the rows in the test data  
+2) Calculate MSE (mean of all the squared differences between actual and predicted prices)  
+3) Store this MSE in storage bin  
+
+```{r}
+for(i in 1:nrow(storage.bin)){
+        preds <- predict(mlr.mod.list[[i]], test.data)
+        mse <- mean((preds-test.data$price)^2)
+        storage.bin$MSE[i] <- mse
+}
+```
+
+Find best model in terms of minimum prediction error
+```{r}
+which.min(storage.bin$MSE)
+best.pred.mod <- which.min(storage.bin$MSE)
+storage.bin[best.pred.mod,]
+```
+
+This shows that mod1 performed the best in terms of prediction: 
+
+price ~ bedrooms + bathrooms + sqft_living + waterfront + view + grade + yr_built + lat
+
+```{r}
+summary(mod1)
+```
+
+###Conclusion
+
+This suggests that based on multiple linear regression, out of these 8 models the following is the best equation to predict housing prices:
+
+```{r, echo = FALSE, message=FALSE}
+str_break = function(x, width = 80L) {
+  n = nchar(x)
+  if (n <= width) return(x)
+  n1 = seq(1L, n, by = width)
+  n2 = seq(width, n, by = width)
+  if (n %% width != 0) n2 = c(n2, n)
+  substring(x, n1, n2)
+}
+```
+
+```{r, tidy=FALSE}
+cf = as.character(coefficients(mod1))
+cf.names = names(coefficients(mod1))
+best.line.str <- paste('The best multiple regression line is described by: Price =', cf[1], '+ ', cf.names[2], '*', cf[2], '+', cf.names[3], '*', cf[3], '+',cf.names[4], '*', 
+      cf[4], '+',cf.names[5], '*', cf[5], '+',cf.names[6], '*', cf[6], '+',
+      cf.names[7], '*', cf[7], '+',cf.names[8], '*', cf[8], '+',cf.names[9], '*', cf[9])
+str_break(best.line.str)
+```
+###Comparison to the other models
+
+So far of the 3 regression models we've build, our folk wisdom model is the 
+best at predicting. 
+
+
+##K-Nearest Neighbors Regression
+Now let's try a different version of regression to see if it improves our predictive performance.
+
+###Preprocessing
+
+First standardize variables for better neighborhood calculations
+```{r}
+train.data <- data.frame(apply(train.data, 2, scale))
+test.data <- data.frame(apply(test.data, 2, scale))
+```
+
+###Initial model comparison to multiple linear regression
+To start, let's fit a KNN with K=5 then check test performance using training set. 
+For this let's use the same predictors from our best multiple linear regression model to compare.
+
+```{r}
+knnTest <- knn.reg(train = train.data[,c("bedrooms", "bathrooms", "sqft_living", 
+                                         "waterfront", "view", "grade", "yr_built", "lat")],
+                   test = test.data[,c("bedrooms", "bathrooms", "sqft_living", 
+                                       "waterfront", "view", "grade", "yr_built", "lat")],
+                   y = train.data$price, k = 5, algorithm = "brute")
+
+knnTestMSE <- mean((test.data$price-knnTest$pred)^2)
+paste('The KNN MSE is ', knnTestMSE)
+```
+
+This MSE is very different from our MSE in the multiple linear regression models. That is because with KNN we scaled the data. Let's now re-train our best multiple linear regression model on the scaled data and compare the results to the KNN. 
+
+```{r}
+mod1b <- lm(price ~ bedrooms + bathrooms + sqft_living + waterfront + 
+                    view + grade + yr_built + lat, data = train.data)
+preds <- predict(mod1b, test.data)
+mlr.mse <- mean((test.data$price-preds)^2)
+paste('The best multiple linear regression MSE is', mlr.mse)
+```
+These results suggests that our KNN model obtains better predictive performance than our best multiple linear regression. 
+
+###Model parameter tuning
+Now let's find the best K parameter. K could be 2, 3, 4, 5, 6, 7, 8, etc. 
+
+So, let's first set up an empty storage bin to iterate over.
+```{r}
+k.bin <- data.frame(K_val = 2:10, MSE = numeric(length(2:10)))
+k.bin
+```
+
+We'll iterate over each row in this bin, building a model with the respective K parameter, and then making predictions on the test data. We'll store the prediction error (MSE) in the appropriate column.
+```{r}
+for (i in 1:nrow(k.bin)){
+        knnTest <- knn.reg(train = train.data[,c("bedrooms", "bathrooms", "sqft_living", 
+                                                 "waterfront", "view", "grade", "yr_built", "lat")],
+                           test = test.data[,c("bedrooms", "bathrooms", "sqft_living", 
+                                               "waterfront", "view", "grade", "yr_built", "lat")],
+                           y = train.data$price, k = k.bin$K_val[i], algorithm = "brute")
+        
+        testMSE <- mean((test.data$price-knnTest$pred)^2)
+        k.bin$MSE[i] <- testMSE
+}
+```
+
+###Predictive Performance
+```{r}
+best.k.row <- which.min(k.bin$MSE)
+k.bin[best.k.row,]
+```
+
+This suggests a K-value of 8 is the best parameter to use and that this model is giving us marked improvement over our multiple linear regression model.
+
+##Ridge Regression
+
+Now let's try ridge regression to see if we can improve performance any more.
+
+###Preprocessing
+Note, for glmnet, the cross validation does K-Fold CV.
+
+###Model parameter validation
+First build 4 models, each with a different lambda value. 
+Lambda ranges from .001 to 10 to give good coverage of possible values. 
+
+```{r}
+my_ridge_mods <- glmnet(x = as.matrix(train.data[,c("bedrooms", "bathrooms", "sqft_living", 
+                                                 "waterfront", "view", "grade", "yr_built", "lat")]), y = train.data$price, 
+                           alpha = 0, lambda = c(.001, .1, 1, 10))
+```
+
+The following plot shows how the regression coefficients get penalized across values of lambda. You can see that as lambda increases, the penalty on each predictor increases, and the respective values of each coefficient approach zero. 
+```{r}
+tidy_ridge_mods <- tidy(my_ridge_mods)
+ggplot(tidy_ridge_mods, aes(lambda, estimate, color = term)) + geom_line()
+```
+
+Next let's do 5-fold cross validation on the models. We'll do an order of magnitude approach so our lambda values cover a wide range of possibilities. Once we determine which lambda values are best in terms of predictive performance, we can then fine-tune within that range. 
+
+```{r}
+my_ridge_mods.cv <- cv.glmnet(x = as.matrix(train.data[,c("bedrooms", "bathrooms", "sqft_living","waterfront", "view", "grade", "yr_built", "lat")]), 
+                              y = train.data$price, 
+                              alpha = 0, 
+                              lambda = c(.001, .1, 1, 10))
+my_ridge_mods.cv$lambda
+my_ridge_mods.cv$cvm
+```
+
+So .001 to .1 is the best in terms of prediction error. 
+
+
+Now we'll train many models within lambda range of .001 to .1 and see which one predicts the best. 
+
+```{r}
+my_best_ridge_mods <- cv.glmnet(x = as.matrix(train.data[,c("bedrooms", "bathrooms", "sqft_living","waterfront", "view", "grade", "yr_built", "lat")]), y = train.data$price, 
+                                alpha = 0, lambda = seq(0.001, .1, by = .01))
+```
+
+Find best lambda values
+```{r}
+which.min(my_best_ridge_mods$cvm)
+my_best_lambda <- my_best_ridge_mods$lambda[which.min(my_best_ridge_mods$cvm)]
+paste('My best lambda is', my_best_lambda)
+```
+
+Build model with best equation
+```{r}
+newmyridge <- lm.ridge(price ~ bedrooms + bathrooms + sqft_living + waterfront + view + grade + yr_built + lat, data = train.data, lambda=my_best_lambda)
+
+cf = as.character(coefficients(newmyridge))
+cf.names = names(coefficients(newmyridge))
+best.ridge.str <- paste('The best ridge regression line is described by:', 'Price =', cf[1], '+', 
+      cf.names[2], '*', cf[2], '+', cf.names[3], '*', cf[3], '+',cf.names[4], '*', 
+      cf[4], '+',cf.names[5], '*', cf[5], '+',cf.names[6], '*', cf[6], '+',
+      cf.names[7], '*', cf[7], '+',cf.names[8], '*', cf[8], '+',cf.names[9], '*', 
+      cf[9])
+str_break(best.ridge.str)
+```
+
+###Predictive Performance
+Now that we have the best lambda, plug in to our model and predict with it.  
+
+Note, there is no predict function for lm.ridge, so we must make predictions manually based on coefficient values.
+
+```{r}
+pred.ridge <- coef(newmyridge)[1] + 
+        coef(newmyridge)[2]*test.data[,'bedrooms'] + coef(newmyridge)[3]*test.data[,'bathrooms'] + 
+        coef(newmyridge)[4]*test.data[,'sqft_living'] + coef(newmyridge)[5]*test.data[,'waterfront'] + 
+        coef(newmyridge)[6]*test.data[,'view'] + coef(newmyridge)[7]*test.data[,'grade'] + 
+        coef(newmyridge)[8]*test.data[,'yr_built'] + coef(newmyridge)[9]*test.data[,'lat']
+```
+
+Find the prediction error for ridge. 
+```{r}
+final.ridge.mse <- mean((pred.ridge - test.data$price)^2)
+final.ridge.mse
+```
+
+
+##Final comparison of all models
+```{r}
+paste('The multiple linear regression MSE is ', mlr.mse)
+paste('The KNN MSE is ', knnTestMSE)
+paste('The Ridge Regression MSE is ', final.ridge.mse)
+```
+
+Overall, ridge and multiple linear regression perform at about the same level. Of noticable improvement was the K-Nearest Neighbors model, which had the lowest prediction error. 
